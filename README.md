@@ -29,11 +29,13 @@ TurboQuant compresses the KV cache using random rotation + optimal scalar quanti
 
 ## Tested on real hardware
 
+All tests run on a [Minisforum AtomMan G7 Pt](https://www.minisforum.com/fr/products/atomman-g7-pt) (AMD Ryzen 9 7945HX, AMD Radeon RX 7600M XT 8 GB, 32 GB DDR5):
+
 | Hardware | Model | Result |
 |----------|-------|--------|
-| AMD RX 7600M XT (8 GB) | Qwen2.5-1.5B (GQA) | 81% token match vs FP16, same speed, 7.1x KV compression |
-| AMD RX 7600M XT (8 GB) | GPT-2 | 32.5 tok/s with compression, cache stored as packed uint8 |
-| CPU (Ryzen 9 7945HX) | GPT-2 | All 98 tests pass, generation verified |
+| AMD RX 7600M XT (8 GB, DirectML) | Qwen2.5-1.5B (GQA) | 81% token match vs FP16, same speed, 7.1x KV compression |
+| AMD RX 7600M XT (8 GB, DirectML) | GPT-2 | 32.5 tok/s with compression, cache stored as packed uint8 |
+| CPU (Ryzen 9 7945HX) | GPT-2 | All 99 tests pass, generation verified |
 
 ## Installation
 
