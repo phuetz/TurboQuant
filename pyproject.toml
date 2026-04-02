@@ -1,0 +1,21 @@
+[build-system]
+requires = ["setuptools>=68.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "turboquant"
+version = "0.1.0"
+description = "TurboQuant: Near-optimal KV cache compression for LLMs"
+readme = "README.md"
+requires-python = ">=3.10"
+license = {text = "MIT"}
+dependencies = [
+    "torch>=2.1",
+    "transformers>=4.45",
+]
+
+[project.optional-dependencies]
+eval = ["datasets>=3.4"]
+
+[tool.setuptools.packages.find]
+include = ["turboquant_harness*"]
