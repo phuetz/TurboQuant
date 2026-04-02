@@ -358,5 +358,5 @@ TurboQuant/
 
 ## References
 
-- Paper: [arXiv:2504.19874](https://arxiv.org/abs/2504.19874)
+- Paper: [arXiv:2504.19874](https://arxiv.org/abs/2504.19874) ([PDF local](docs/paper.pdf))
 - Google Research blog: [TurboQuant: Redefining AI Efficiency](https://research.google/blog/turboquant-redefining-ai-efficiency-with-extreme-compression/)
