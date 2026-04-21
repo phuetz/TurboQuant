@@ -27,7 +27,7 @@ def get_gpu_memory():
     info = []
     for i in range(torch.cuda.device_count()):
         used = torch.cuda.memory_allocated(i) / 1e9
-        total = torch.cuda.get_device_properties(i).total_mem / 1e9
+        total = torch.cuda.get_device_properties(i).total_memory / 1e9
         info.append((used, total))
     return info
 

@@ -13,7 +13,7 @@ assert torch.cuda.is_available(), "CUDA not available! Install PyTorch with CUDA
 print(f"PyTorch {torch.__version__}, CUDA {torch.version.cuda}")
 for i in range(torch.cuda.device_count()):
     name = torch.cuda.get_device_name(i)
-    mem = torch.cuda.get_device_properties(i).total_mem / 1e9
+    mem = torch.cuda.get_device_properties(i).total_memory / 1e9
     print(f"  GPU {i}: {name} ({mem:.0f} GB)")
 
 print("\nLoading Qwen2.5-1.5B on GPU...")

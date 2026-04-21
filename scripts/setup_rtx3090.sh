@@ -36,7 +36,7 @@ import torch
 print(f'PyTorch {torch.__version__}, CUDA {torch.version.cuda}')
 print(f'GPUs: {torch.cuda.device_count()}')
 for i in range(torch.cuda.device_count()):
-    print(f'  GPU {i}: {torch.cuda.get_device_name(i)} ({torch.cuda.get_device_properties(i).total_mem / 1e9:.0f} GB)')
+    print(f'  GPU {i}: {torch.cuda.get_device_name(i)} ({torch.cuda.get_device_properties(i).total_memory / 1e9:.0f} GB)')
 from turboquant_harness import TurboQuantCache
 print('TurboQuantCache: OK')
 "
