@@ -69,7 +69,7 @@ class TurboQuantLayer(QuantizedLayer):
 
     def _quantize(self, tensor: torch.Tensor, axis: int):
         device = tensor.device
-        code = self._quantizer.quantize_tensor(tensor.float().cpu())
+        code = self._quantizer.quantize_tensor(tensor.float())
         indices = code.indices
         if self._pack is not None:
             indices = self._pack(indices.to(torch.uint8))
@@ -112,7 +112,7 @@ class TurboQuantProdLayer(QuantizedLayer):
 
     def _quantize(self, tensor: torch.Tensor, axis: int):
         device = tensor.device
-        code = self._quantizer.quantize_tensor(tensor.float().cpu())
+        code = self._quantizer.quantize_tensor(tensor.float())
         mse_idx = code.mse_indices
         if self._mse_pack is not None:
             mse_idx = self._mse_pack(mse_idx.to(torch.uint8))

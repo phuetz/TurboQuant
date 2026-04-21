@@ -2,6 +2,8 @@
 
 First CUDA RTX 3090 benchmark of TurboQuant on this repo. Hardware tested: 2× NVIDIA RTX 3090 (24 GB each).
 
+> **Update — keep-on-GPU patch landed**. Removing the CPU roundtrip in `_quantize`/`_dequantize` brings 4-bit long-context decode from **3.1 → 10.3 tok/s (×3.3)**. The full table below shows before/after.
+
 ## Setup
 
 - Hardware: 2× RTX 3090 24 GB (DARKSTAR)
@@ -13,13 +15,28 @@ First CUDA RTX 3090 benchmark of TurboQuant on this repo. Hardware tested: 2× N
 
 ## Results — generation throughput (100 new tokens)
 
+### Before the GPU patch (CPU roundtrip in _quantize/_dequantize)
+
 | Cache | short (12 tok prompt) | medium (71 tok) | long_context (2628 tok) |
 |---|---:|---:|---:|
 | FP16 | 12.9 tok/s | 14.8 tok/s | 12.8 tok/s |
 | TurboQuant 4-bit MSE | 11.5 tok/s | 9.4 tok/s | **3.1 tok/s** |
 | TurboQuant 2-bit MSE | 10.8 tok/s | 9.3 tok/s | 3.2 tok/s |
 
-**4-bit and 2-bit have nearly identical throughput** on this hardware — within noise. That's the smoking gun: speed is bottlenecked by data movement (GPU↔CPU roundtrip per layer per attention step), not by the bit width of the codebook lookup. Compressing further doesn't help speed; it only shrinks the cache.
+**4-bit and 2-bit had nearly identical throughput** — within noise. That was the smoking gun: speed was bottlenecked by data movement (GPU↔CPU roundtrip per layer per attention step), not by the bit width of the codebook lookup.
+
+### After the GPU patch (cache stays on cuda:0)
+
+| Cache | short | medium | long_context |
+|---|---:|---:|---:|
+| FP16 | 13.0 tok/s | 15.0 tok/s | 13.0 tok/s |
+| **TurboQuant 4-bit MSE** | **11.6 tok/s** | **11.6 tok/s** | **10.3 tok/s** |
+| Δ vs FP16 | −11% | −23% | **−21%** |
+| Speedup vs CPU-roundtrip path | ×1.0 | ×1.2 | **×3.3** |
+
+The patch adds lazy device migration to the rotation matrix, centroids, boundaries, and Walsh-Hadamard sign vectors so they follow the input tensor's device. `_flatten_last_dim` no longer forces `.cpu()`. `MseTensorCode` and `ProdTensorCode` now keep `indices`/`norms` on the input device — the cache itself stores them as `torch.uint8` on `cuda:0` (verified via `quicktest_cuda.py`).
+
+The output is identical to the CPU-roundtrip version on the smoke test (FP16 and TQ-4bit produced the same first ~50 tokens of Qwen's response). The patch is purely a data-movement optimization, not a numerical change.
 
 ## Memory
 
@@ -50,12 +67,11 @@ For `short` prompt (12 tokens in, 100 out, greedy decode), FP16 and TQ-4bit prod
 
 ## Suggestions for follow-up
 
-The 4-bit vs 2-bit identical throughput pinpoints the bottleneck at data movement, not arithmetic. Concrete next steps in priority order:
-
-1. **Keep cache on GPU**: drop the `.cpu()` calls in `cache.py` (lines 72, 83, 115, 131) and `quantization.py` (lines 233-234, 292-294). `torch.bucketize` and the Walsh-Hadamard rotation already work on CUDA. This is the single biggest win: it eliminates the roundtrip that dominates long-context decode.
-2. **Fused dequant in attention**: dequantize on-the-fly during `Q @ K.T` instead of materializing the full FP16 K tensor. Avoids a second pass through memory.
+1. ~~**Keep cache on GPU**: drop the `.cpu()` calls~~ ✅ done — see "After the GPU patch" above. ×3.3 on long-context decode.
+2. **Fused dequant in attention**: dequantize on-the-fly during `Q @ K.T` instead of materializing the full FP16 K tensor. Avoids a second pass through memory. Likely closes most of the remaining 21% gap with FP16.
 3. **NIAH on RTX 3090**: replicate the README's NIAH retrieval table on CUDA — currently only Apple Silicon validated.
-4. **Fast Walsh-Hadamard CUDA kernel**: `iterative FWHT` in PyTorch is O(d log d) but Python-overheaded. Custom CUDA would help.
+4. **Fast Walsh-Hadamard CUDA kernel**: iterative FWHT in PyTorch is O(d log d) but Python-overheaded. Custom CUDA would help further.
+5. **Re-bench 2-bit with GPU patch**: with arithmetic now actually mattering (no CPU roundtrip masking it), 2-bit may show a small additional speedup — to be measured.
 
 ## Reproducibility
 

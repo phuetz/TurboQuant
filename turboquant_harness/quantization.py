@@ -211,12 +211,25 @@ class TorchTurboQuantMse:
         self.centroids = torch.tensor(centroids, dtype=dtype)
         self.boundaries = torch.tensor(boundaries, dtype=dtype)
 
+    def _migrate_to(self, device: torch.device) -> None:
+        """Lazy device migration so rotation/centroids/boundaries match input device."""
+        if self.rotation is not None and self.rotation.device != device:
+            self.rotation = self.rotation.to(device)
+        if self.centroids.device != device:
+            self.centroids = self.centroids.to(device)
+        if self.boundaries.device != device:
+            self.boundaries = self.boundaries.to(device)
+        if self._wht is not None:
+            self._wht._migrate_to(device)
+
     def _rotate(self, x: torch.Tensor) -> torch.Tensor:
+        self._migrate_to(x.device)
         if self._wht is not None:
             return self._wht.apply(x)
         return x @ self.rotation.T
 
     def _rotate_inverse(self, x: torch.Tensor) -> torch.Tensor:
+        self._migrate_to(x.device)
         if self._wht is not None:
             return self._wht.apply_transpose(x)
         return x @ self.rotation
@@ -231,9 +244,11 @@ class TorchTurboQuantMse:
         normalized = torch.where(norms > 0, flat / safe_norms, torch.zeros_like(flat))
         rotated = self._rotate(normalized)
         indices = _bucketize_centroids(rotated, self.boundaries).to(torch.int16)
-        return MseTensorCode(indices=indices.cpu(), norms=norms.squeeze(-1).cpu(), original_shape=shape)
+        # Stay on the input device — caller decides if/when to move to CPU for storage.
+        return MseTensorCode(indices=indices, norms=norms.squeeze(-1), original_shape=shape)
 
     def dequantize_tensor(self, code: MseTensorCode) -> torch.Tensor:
+        self._migrate_to(code.indices.device)
         rotated = self.centroids[code.indices.long()]
         decoded = self._rotate_inverse(rotated)
         decoded = decoded * code.norms.to(decoded.dtype).unsqueeze(-1)
@@ -289,9 +304,9 @@ class TorchTurboQuantProd:
 
         return ProdTensorCode(
             mse_indices=mse_code.indices,
-            qjl_signs=signs.cpu(),
-            norms=norms.squeeze(-1).cpu(),
-            residual_norms=residual_norms.squeeze(-1).cpu(),
+            qjl_signs=signs,
+            norms=norms.squeeze(-1),
+            residual_norms=residual_norms.squeeze(-1),
             original_shape=shape,
         )
 
@@ -300,6 +315,8 @@ class TorchTurboQuantProd:
             MseTensorCode(indices=code.mse_indices, norms=torch.ones_like(code.norms), original_shape=code.original_shape)
         ).reshape(-1, self.dimension)
         sign_values = torch.where(code.qjl_signs, 1.0, -1.0).to(self.dtype)
+        if self.sketch.device != sign_values.device:
+            self.sketch = self.sketch.to(sign_values.device)
         projected = sign_values @ self.sketch
         scale = DEFAULT_QJL_SCALE * code.residual_norms.to(self.dtype).unsqueeze(-1) / self.dimension
         qjl = projected * scale
@@ -404,7 +421,8 @@ def _flatten_last_dim(tensor: torch.Tensor) -> tuple[torch.Tensor, tuple[int, ..
     if tensor.ndim == 0:
         raise ValueError("tensor must have at least one dimension")
     shape = tuple(int(part) for part in tensor.shape)
-    flat = tensor.detach().to(torch.float32).reshape(-1, shape[-1]).cpu()
+    # Stay on the input device — let downstream quantizers migrate their state if needed.
+    flat = tensor.detach().to(torch.float32).reshape(-1, shape[-1])
     return flat, shape
 
 
@@ -457,12 +475,20 @@ class _WalshHadamardRotation:
         # (we override apply methods instead)
         self.T = self  # sentinel: will not be used for matmul
 
+    def _migrate_to(self, device: torch.device) -> None:
+        if self.signs_pre.device != device:
+            self.signs_pre = self.signs_pre.to(device)
+        if self.signs_post.device != device:
+            self.signs_post = self.signs_post.to(device)
+
     def apply(self, x: torch.Tensor) -> torch.Tensor:
         """Apply forward rotation: y = scale * signs_post * FWHT(signs_pre * x)."""
+        self._migrate_to(x.device)
         return self._transform(x, self.signs_pre, self.signs_post)
 
     def apply_transpose(self, x: torch.Tensor) -> torch.Tensor:
         """Apply inverse rotation (WHT is self-adjoint, so swap pre/post signs)."""
+        self._migrate_to(x.device)
         return self._transform(x, self.signs_post, self.signs_pre)
 
     def _transform(self, x: torch.Tensor, left_signs: torch.Tensor, right_signs: torch.Tensor) -> torch.Tensor:
