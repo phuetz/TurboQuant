@@ -73,6 +73,24 @@ For `short` prompt (12 tokens in, 100 out, greedy decode), FP16 and TQ-4bit prod
 4. **Fast Walsh-Hadamard CUDA kernel**: iterative FWHT in PyTorch is O(d log d) but Python-overheaded. Custom CUDA would help further.
 5. **Re-bench 2-bit with GPU patch**: with arithmetic now actually mattering (no CPU roundtrip masking it), 2-bit may show a small additional speedup — to be measured.
 
+## Scaling test — where does compression actually help?
+
+After the GPU patch landed, I pushed the context length to see where TurboQuant's memory savings start to matter in practice.
+
+| Context | Model weights | FP16 cache | TQ-4bit cache | Notes |
+|---:|---|---:|---:|---|
+| 2 628 | FP16 (14 GB) | 12.8 tok/s | 10.3 tok/s | TQ −21% vs FP16 |
+| 7 818 | bnb 4-bit (4.4 GB) | 5.6 tok/s | 5.5 tok/s | **TQ reaches parity** — the overhead amortises |
+| 15 618 | bnb 4-bit (4.4 GB) | **OOM** | **OOM** | Both die in SDPA prefill (25 GiB alloc request) |
+
+**Surprising but informative finding at 16K**: both caches OOM, for the same reason. The OOM is in `torch.nn.functional.scaled_dot_product_attention` during prefill, not in the KV cache storage. SDPA materialises the full `Q @ K.T` logits tensor (≈ context² × heads × FP16), which at 16K alone is 25 GiB for Qwen-7B. Compressing the stored cache (what TurboQuant does) does not prevent this — the attention matrix has to be FP16 to run SDPA as it stands today.
+
+**Practical implications**:
+
+- For contexts **≤ 8K** on a 7B model with a single 24 GB GPU, TurboQuant already works and matches FP16 speed after the GPU patch.
+- Going above 8K requires Flash-Attention (which never materialises the logits tensor) or an attention implementation that consumes the quantised cache directly. TurboQuant's compression is orthogonal to this — the two optimisations compose.
+- The path to 32K+ on RTX 3090 is: TurboQuant (stored cache) + Flash-Attention (attention compute) + fused dequant (skip the FP16 intermediate). The first piece is in place; the other two are upstream to pytorch/attention libraries.
+
 ## Reproducibility
 
 ```bash

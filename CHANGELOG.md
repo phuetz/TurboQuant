@@ -39,9 +39,14 @@ python scripts/benchmark_devstral.py \
   --output artifacts/benchmark_qwen7b_3090.json
 ```
 
+### Scaling test — context length sweep
+
+Pushed the same harness to 8K and 16K. With bnb 4-bit weights (frees ~10 GB), TurboQuant matches FP16 throughput at 8K (5.5 vs 5.6 tok/s). At 16K, **both** caches OOM in SDPA's `Q @ K.T` materialisation (25 GiB alloc), not in the KV storage — TurboQuant can't help when the bottleneck is the attention matrix itself. Flash-Attention is the missing piece for 32K+ on RTX 3090.
+
 ### Open follow-ups
 
-1. Fused dequant inside attention (`Q @ K.T`) to close the remaining 21% vs FP16.
-2. NIAH retrieval validation on RTX 3090 (currently Apple Silicon only in the README).
-3. Custom CUDA kernel for the iterative FWHT (Python overhead is now visible).
-4. Bench with bigger model (Devstral 24B, Llama-70B Q4_K_M) to confirm the trend at scale.
+1. Fused dequant inside attention (`Q @ K.T`) to close the remaining 21% vs FP16 at medium context.
+2. Flash-Attention path so context can scale past SDPA's FP16 logits ceiling.
+3. NIAH retrieval validation on RTX 3090 (currently Apple Silicon only in the README). The legacy `hf_runner.generate_incremental` path needs a transformers v5 compat shim — separate work.
+4. Custom CUDA kernel for the iterative FWHT (Python overhead is now visible after the GPU patch).
+5. Bench with bigger model (Devstral 24B, Llama-70B Q4_K_M) to confirm the trend at scale.
