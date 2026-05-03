@@ -1,5 +1,22 @@
 # Changelog
 
+## Unreleased — KV cache disk persistence (2026-05-03)
+
+### Features
+
+- **`TurboQuantCache.save_to_disk(path)` / `load_from_disk(path, model_config=...)`.** Serialises the full cache state (quantized prefix, residual tail, per-layer rotation seed, cumulative_length) to a single `.pt` file, portable across hosts. Reload lands the cache straight on a chosen device via `map_location=...`.
+
+  **Impact on Qwen2.5-1.5B / RTX 3090 / fp16:**
+
+  | Context | Prefill | Save | Load | Disk | FP16 raw | Compression | Load speedup |
+  |--------:|--------:|-----:|-----:|-----:|---------:|------------:|-------------:|
+  | 2048    | 587.6 ms | 26.7 ms | 48.1 ms | 16.4 MB | 56.0 MB | 3.42x | **12.2x** |
+  | 8192    | 2495.2 ms | 75.0 ms | 68.6 ms | 65.4 MB | 224.0 MB | 3.42x | **36.4x** |
+
+  Speedup scales with context length (prefill is O(N²), load is O(N)). Use cases: session resume, cross-host KV shipping over a tailnet (compressed payload 3.4x smaller than raw FP16 dump), reusable system-prompt prefix caches. Full bench in [`docs/benchmarks/cache_persistence_rtx3090.md`](docs/benchmarks/cache_persistence_rtx3090.md).
+
+  Tested via 7 new unit tests (`python_tests/test_persistence.py`) including a forward-pass round-trip on a real model that asserts bitwise-equal logits across save/load.
+
 ## Unreleased — RTX 3090 / CUDA optimisations (2026-04-22)
 
 ### Performance
