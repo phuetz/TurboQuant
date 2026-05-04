@@ -69,7 +69,12 @@ def main():
     ap.add_argument("--ctx", type=int, default=2048)
     ap.add_argument("--nbits", type=int, default=4)
     ap.add_argument("--residual-length", type=int, default=128)
-    ap.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
+    ap.add_argument(
+        "--device",
+        default="auto" if torch.cuda.is_available() and torch.cuda.device_count() > 1 else
+                ("cuda" if torch.cuda.is_available() else "cpu"),
+        help="Pass 'auto' to spread across all visible GPUs (HF device_map='auto').",
+    )
     ap.add_argument("--dtype", default="float16",
                     choices=["float16", "bfloat16", "float32"])
     ap.add_argument("--save-load-cycles", type=int, default=3,
@@ -94,6 +99,14 @@ def main():
         args.model, dtype=dtype, device_map=args.device, local_files_only=False,
     )
     model.eval()
+
+    # Resolve a concrete device for tensors (input_ids, cache load target).
+    # device_map="auto" places submodules across GPUs; we still need a single
+    # device for the input embeddings / load target. Use embed_tokens' device.
+    if args.device == "auto":
+        target_device = next(model.parameters()).device
+    else:
+        target_device = torch.device(args.device)
 
     ids = make_prompt(tokenizer, args.ctx).to(model.device)
     print(f"Prompt shape: {tuple(ids.shape)}")
@@ -124,7 +137,7 @@ def main():
             _, dt_load = time_block(
                 "load_from_disk (to device)",
                 lambda: TurboQuantCache.load_from_disk(
-                    path, model_config=model.config, map_location=args.device,
+                    path, model_config=model.config, map_location=target_device,
                 ),
             )
             load_dts.append(dt_load)

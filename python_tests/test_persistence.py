@@ -12,6 +12,7 @@ from turboquant_harness.cache import (
     CACHE_FORMAT_VERSION,
     TurboQuantLayer,
     TurboQuantProdLayer,
+    _restore_layer,
 )
 
 
@@ -176,6 +177,106 @@ class CacheSaveLoadTests(unittest.TestCase):
         fp16_bytes = 2 * 8 * 4 * seq * 128 * 2  # 2 (K+V) * layers * heads * seq * head_dim * fp16
         self.assertLess(disk_bytes, fp16_bytes,
                         f"On-disk size {disk_bytes} should be < raw FP16 {fp16_bytes}")
+
+
+class SafetensorsBackendTests(unittest.TestCase):
+    """Cover the .safetensors path: same round-trip guarantees as .pt,
+    plus byte-equal dequantize. Activated via the file extension."""
+
+    def test_safetensors_round_trip_mse(self):
+        cfg = _FakeConfig(num_layers=4, head_dim=64, num_heads=4)
+        cache = TurboQuantCache(cfg, nbits=4, residual_length=16, mode="mse")
+        _populate_cache(cache, head_dim=64, seq=80)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            p = os.path.join(tmp, "cache.safetensors")
+            cache.save_to_disk(p)
+            self.assertTrue(os.path.exists(p))
+            self.assertGreater(os.path.getsize(p), 0)
+            reloaded = TurboQuantCache.load_from_disk(p, model_config=cfg)
+
+        self.assertEqual(len(reloaded.layers), len(cache.layers))
+        for orig, rl in zip(cache.layers, reloaded.layers):
+            self.assertEqual(type(orig), type(rl))
+            self.assertEqual(orig.get_seq_length(), rl.get_seq_length())
+            if isinstance(orig, TurboQuantLayer):
+                self.assertTrue(torch.equal(orig._quantized_keys[0].cpu(),
+                                            rl._quantized_keys[0].cpu()))
+                self.assertTrue(torch.equal(orig._quantized_values[0].cpu(),
+                                            rl._quantized_values[0].cpu()))
+
+    def test_safetensors_round_trip_prod(self):
+        cfg = _FakeConfig(num_layers=3, head_dim=64, num_heads=4)
+        cache = TurboQuantCache(cfg, nbits=4, residual_length=16, mode="prod")
+        _populate_cache(cache, head_dim=64, seq=80)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            p = os.path.join(tmp, "cache.safetensors")
+            cache.save_to_disk(p)
+            reloaded = TurboQuantCache.load_from_disk(p, model_config=cfg)
+
+        for orig, rl in zip(cache.layers, reloaded.layers):
+            self.assertEqual(type(orig), type(rl))
+            if isinstance(orig, TurboQuantProdLayer):
+                self.assertTrue(torch.equal(orig._quantized_keys[0].cpu(),
+                                            rl._quantized_keys[0].cpu()))
+
+    def test_safetensors_dequantize_consistency(self):
+        cfg = _FakeConfig(num_layers=2, head_dim=64, num_heads=4)
+        cache = TurboQuantCache(cfg, nbits=4, residual_length=16)
+        _populate_cache(cache, head_dim=64, seq=64)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            p = os.path.join(tmp, "cache.safetensors")
+            cache.save_to_disk(p)
+            rl = TurboQuantCache.load_from_disk(p, model_config=cfg)
+
+        for orig, rec in zip(cache.layers, rl.layers):
+            if isinstance(orig, TurboQuantLayer):
+                deq_orig_k = orig._dequantize(orig._quantized_keys)
+                deq_rec_k = rec._dequantize(rec._quantized_keys)
+                self.assertTrue(torch.equal(deq_orig_k, deq_rec_k))
+
+    def test_safetensors_no_pickle_in_file(self):
+        """A .safetensors file must not contain pickle headers. Quick sanity
+        check that we are not accidentally falling back to torch.save."""
+        cfg = _FakeConfig(num_layers=2, head_dim=32, num_heads=4)
+        cache = TurboQuantCache(cfg, nbits=4, residual_length=16)
+        _populate_cache(cache, head_dim=32, seq=48)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            p = os.path.join(tmp, "cache.safetensors")
+            cache.save_to_disk(p)
+            with open(p, "rb") as fh:
+                head = fh.read(64)
+
+        # safetensors files start with an 8-byte little-endian header length,
+        # followed by a JSON object. Pickle starts with b"\x80\x04" (protocol 4)
+        # or torch's zip wrapper b"PK". Neither marker should be at offset 0.
+        self.assertNotIn(b"PK", head[:4])
+        self.assertNotIn(b"\x80\x04", head[:4])
+
+
+class KindMismatchTests(unittest.TestCase):
+    """The restore path must refuse to install a prod-shaped state into
+    an MSE layer, and vice versa, with a clear error."""
+
+    def test_mismatch_raises(self):
+        cfg = _FakeConfig(num_layers=2, head_dim=32, num_heads=4)
+        cache = TurboQuantCache(cfg, nbits=4, residual_length=16, mode="mse")
+        _populate_cache(cache, head_dim=32, seq=48)
+
+        # MSE layer in cache, but state claims to be prod.
+        bad_state = {
+            "kind": "turboquant_prod",
+            "cumulative_length": 48,
+            "keys": cache.layers[1].keys.cpu(),
+            "values": cache.layers[1].values.cpu(),
+            "quantized_keys": None,
+            "quantized_values": None,
+        }
+        with self.assertRaisesRegex(ValueError, "Layer kind mismatch"):
+            _restore_layer(cache.layers[1], bad_state, torch.device("cpu"))
 
 
 class ForwardPassRoundTripTest(unittest.TestCase):

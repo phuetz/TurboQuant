@@ -1,9 +1,11 @@
 # Changelog
 
-## Unreleased — KV cache disk persistence (2026-05-03)
+## Unreleased — KV cache disk persistence (2026-05-03 / 2026-05-04)
 
 ### Features
 
+- **`safetensors` backend for `save_to_disk` / `load_from_disk` (2026-05-04).** When the file path ends in `.safetensors` (or `.st`), the cache state is serialised through `safetensors.torch.save_file` instead of `torch.save`. This is the format to use when shipping caches between hosts: loading a `.safetensors` file does not invoke pickle, removing the RCE risk that would otherwise force you to trust every peer that sent you a cache. Tensors are stored flat, structured metadata lives in the safetensors `metadata` dict (JSON-encoded). Pickle (`torch.save`) is still the default for any other extension.
+- **Layer-kind validation on restore (2026-05-04).** `_restore_layer` now refuses with a clear `ValueError` when the saved layer kind (`turboquant_mse` / `turboquant_prod` / `dynamic`) does not match the kind that the rebuilt cache produced. Previously a mismatch silently installed a wrong-shape state tuple and crashed later in dequantize with an obscure error.
 - **`TurboQuantCache.save_to_disk(path)` / `load_from_disk(path, model_config=...)`.** Serialises the full cache state (quantized prefix, residual tail, per-layer rotation seed, cumulative_length) to a single `.pt` file, portable across hosts. Reload lands the cache straight on a chosen device via `map_location=...`.
 
   **Impact on Qwen2.5-1.5B / RTX 3090 / fp16:**

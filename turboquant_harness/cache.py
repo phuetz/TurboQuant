@@ -16,6 +16,7 @@ Usage::
 
 from __future__ import annotations
 
+import json
 import os
 from pathlib import Path
 
@@ -26,6 +27,7 @@ from .quantization import TorchTurboQuantMse, TorchTurboQuantProd, MseTensorCode
 from .packing import pack_uint4, unpack_uint4, pack_uint2, unpack_uint2
 
 CACHE_FORMAT_VERSION = 1
+SAFETENSORS_SUFFIXES = (".safetensors", ".st")
 
 
 # ---------------------------------------------------------------------------
@@ -269,28 +271,31 @@ class TurboQuantCache(Cache):
     # ------------------------------------------------------------------
 
     def save_to_disk(self, path: str | os.PathLike) -> None:
-        """Save the full cache state to a single ``.pt`` file.
+        """Save the full cache state to disk.
 
-        Tensors are moved to CPU during serialization. The resulting file
-        is portable across machines and PyTorch versions and can be
-        reloaded with :meth:`load_from_disk` on a different host.
+        Two formats are supported, picked from the file extension:
 
-        Args:
-            path: File path. Parent directory must exist.
+        - ``.safetensors`` (or ``.st``) -- safe, structured. Use this for
+          shipping the cache between hosts: loaders cannot execute
+          arbitrary code from the file.
+        - Anything else (typically ``.pt``) -- ``torch.save`` (pickle).
+          Faster to write a fully-arbitrary state but **only load from
+          trusted sources** (pickle can execute code at load time).
 
-        Notes:
-            - Format uses ``torch.save`` (pickle-based). Only load files
-              from trusted sources.
-            - Storage size scales with the quantized payload, not the
-              dequantized one. A 4-bit cache of an 8 GB FP16 prefix will
-              be roughly 1.1 GB on disk.
+        Tensors are moved to CPU during serialisation. Storage size
+        scales with the quantized payload: a 4-bit cache of an 8 GB FP16
+        prefix is roughly 2.4 GB on disk (3.4x compression).
         """
+        p = str(path)
+        if p.lower().endswith(SAFETENSORS_SUFFIXES):
+            self._save_safetensors(p)
+            return
         state = {
             "format_version": CACHE_FORMAT_VERSION,
             "config": dict(self._save_meta),
             "layers": [_serialize_layer(layer) for layer in self.layers],
         }
-        torch.save(state, str(path))
+        torch.save(state, p)
 
     @classmethod
     def load_from_disk(
@@ -302,7 +307,9 @@ class TurboQuantCache(Cache):
         """Reconstruct a cache previously saved with :meth:`save_to_disk`.
 
         Args:
-            path: File path produced by ``save_to_disk``.
+            path: File path produced by ``save_to_disk``. Both ``.pt``
+                (pickle) and ``.safetensors`` formats are auto-detected
+                from the extension.
             model_config: Optional HF model config. If provided, layer
                 count and head dim are validated against the saved
                 metadata. Otherwise the saved metadata is taken as
@@ -311,7 +318,10 @@ class TurboQuantCache(Cache):
                 a specific ``"cuda:0"``) to materialise straight on GPU
                 and skip a CPU round-trip.
         """
-        state = torch.load(str(path), map_location=map_location, weights_only=False)
+        p = str(path)
+        if p.lower().endswith(SAFETENSORS_SUFFIXES):
+            return cls._load_safetensors(p, model_config=model_config, map_location=map_location)
+        state = torch.load(p, map_location=map_location, weights_only=False)
         version = state.get("format_version")
         if version != CACHE_FORMAT_VERSION:
             raise ValueError(
@@ -360,6 +370,135 @@ class TurboQuantCache(Cache):
         for layer, layer_state in zip(cache.layers, state["layers"]):
             _restore_layer(layer, layer_state, target_device)
         return cache
+
+    # -- safetensors backend (safe for cross-host shipping) -----------
+
+    def _save_safetensors(self, path: str) -> None:
+        from safetensors.torch import save_file
+
+        tensors: dict[str, torch.Tensor] = {}
+        metadata: dict[str, str] = {
+            "format_version": str(CACHE_FORMAT_VERSION),
+            "config": json.dumps(self._save_meta),
+        }
+
+        for i, layer in enumerate(self.layers):
+            prefix = f"layer_{i}"
+            kind = _layer_kind(layer)
+            metadata[f"{prefix}.kind"] = kind
+
+            cum = getattr(layer, "cumulative_length", 0)
+            if isinstance(cum, torch.Tensor):
+                cum = int(cum.item())
+            metadata[f"{prefix}.cumulative_length"] = str(cum)
+
+            initialised = (
+                getattr(layer, "is_initialized", False)
+                and layer.keys is not None
+                and layer.values is not None
+            )
+            if initialised:
+                tensors[f"{prefix}.keys"] = layer.keys.detach().cpu().contiguous()
+                tensors[f"{prefix}.values"] = layer.values.detach().cpu().contiguous()
+                metadata[f"{prefix}.has_residual"] = "1"
+            else:
+                metadata[f"{prefix}.has_residual"] = "0"
+
+            if kind == "turboquant_mse":
+                _emit_mse_qt(tensors, metadata, prefix, "qk", getattr(layer, "_quantized_keys", None))
+                _emit_mse_qt(tensors, metadata, prefix, "qv", getattr(layer, "_quantized_values", None))
+            elif kind == "turboquant_prod":
+                _emit_prod_qt(tensors, metadata, prefix, "qk", getattr(layer, "_quantized_keys", None))
+                _emit_prod_qt(tensors, metadata, prefix, "qv", getattr(layer, "_quantized_values", None))
+
+        save_file(tensors, path, metadata=metadata)
+
+    @classmethod
+    def _load_safetensors(
+        cls,
+        path: str,
+        model_config,
+        map_location: str | torch.device,
+    ) -> "TurboQuantCache":
+        from safetensors import safe_open
+
+        if isinstance(map_location, torch.device):
+            ts_device = str(map_location)
+        else:
+            ts_device = map_location
+        target_device = torch.device(ts_device)
+
+        with safe_open(path, framework="pt", device=ts_device) as f:
+            metadata = f.metadata() or {}
+            version_str = metadata.get("format_version", "0")
+            try:
+                version = int(version_str)
+            except ValueError:
+                version = -1
+            if version != CACHE_FORMAT_VERSION:
+                raise ValueError(
+                    f"Unsupported cache format version {version_str!r}; "
+                    f"this build expects {CACHE_FORMAT_VERSION}."
+                )
+            cfg = json.loads(metadata["config"])
+
+            if model_config is not None:
+                text_cfg = (
+                    model_config.get_text_config(decoder=True)
+                    if hasattr(model_config, "get_text_config") else model_config
+                )
+                if cfg["num_layers"] != text_cfg.num_hidden_layers:
+                    raise ValueError(
+                        f"Layer count mismatch: saved cache has {cfg['num_layers']} "
+                        f"layers, model config has {text_cfg.num_hidden_layers}."
+                    )
+                actual_head = getattr(text_cfg, "head_dim", None) or (
+                    text_cfg.hidden_size // text_cfg.num_attention_heads
+                )
+                if cfg["head_dim"] != actual_head:
+                    raise ValueError(
+                        f"head_dim mismatch: saved cache uses {cfg['head_dim']}, "
+                        f"model config has {actual_head}."
+                    )
+                build_config = model_config
+            else:
+                build_config = _StubConfig(cfg["num_layers"], cfg["head_dim"])
+
+            cache = cls(
+                build_config,
+                nbits=cfg["nbits"],
+                residual_length=cfg["residual_length"],
+                base_seed=cfg["base_seed"],
+                skip_layers=set(cfg["skip_layers"]),
+                mode=cfg["mode"],
+                rotation=cfg["rotation"],
+            )
+
+            for i, layer in enumerate(cache.layers):
+                prefix = f"layer_{i}"
+                kind = metadata[f"{prefix}.kind"]
+
+                state = {
+                    "kind": kind,
+                    "cumulative_length": int(metadata[f"{prefix}.cumulative_length"]),
+                }
+                if metadata.get(f"{prefix}.has_residual") == "1":
+                    state["keys"] = f.get_tensor(f"{prefix}.keys")
+                    state["values"] = f.get_tensor(f"{prefix}.values")
+                else:
+                    state["keys"] = None
+                    state["values"] = None
+
+                if kind == "turboquant_mse":
+                    state["quantized_keys"] = _read_mse_qt(f, metadata, prefix, "qk")
+                    state["quantized_values"] = _read_mse_qt(f, metadata, prefix, "qv")
+                elif kind == "turboquant_prod":
+                    state["quantized_keys"] = _read_prod_qt(f, metadata, prefix, "qk")
+                    state["quantized_values"] = _read_prod_qt(f, metadata, prefix, "qv")
+
+                _restore_layer(layer, state, target_device)
+
+            return cache
 
 
 # ---------------------------------------------------------------------------
@@ -437,6 +576,64 @@ def _serialize_prod_quant(t):
     }
 
 
+def _emit_mse_qt(tensors, metadata, prefix, which, qt) -> None:
+    if qt is None:
+        metadata[f"{prefix}.{which}.present"] = "0"
+        return
+    indices, norms, original_shape, original_dtype, _device = qt
+    tensors[f"{prefix}.{which}.indices"] = indices.detach().cpu().contiguous()
+    tensors[f"{prefix}.{which}.norms"] = norms.detach().cpu().contiguous()
+    metadata[f"{prefix}.{which}.original_shape"] = json.dumps(list(original_shape))
+    metadata[f"{prefix}.{which}.original_dtype"] = _dtype_to_str(original_dtype)
+    metadata[f"{prefix}.{which}.present"] = "1"
+
+
+def _emit_prod_qt(tensors, metadata, prefix, which, qt) -> None:
+    if qt is None:
+        metadata[f"{prefix}.{which}.present"] = "0"
+        return
+    mse_idx, qjl_signs, norms, residual_norms, original_shape, original_dtype, _device = qt
+    tensors[f"{prefix}.{which}.mse_indices"] = mse_idx.detach().cpu().contiguous()
+    tensors[f"{prefix}.{which}.qjl_signs"] = qjl_signs.detach().cpu().contiguous()
+    tensors[f"{prefix}.{which}.norms"] = norms.detach().cpu().contiguous()
+    tensors[f"{prefix}.{which}.residual_norms"] = residual_norms.detach().cpu().contiguous()
+    metadata[f"{prefix}.{which}.original_shape"] = json.dumps(list(original_shape))
+    metadata[f"{prefix}.{which}.original_dtype"] = _dtype_to_str(original_dtype)
+    metadata[f"{prefix}.{which}.present"] = "1"
+
+
+def _read_mse_qt(f, metadata, prefix, which):
+    if metadata.get(f"{prefix}.{which}.present", "0") != "1":
+        return None
+    return {
+        "indices": f.get_tensor(f"{prefix}.{which}.indices"),
+        "norms": f.get_tensor(f"{prefix}.{which}.norms"),
+        "original_shape": json.loads(metadata[f"{prefix}.{which}.original_shape"]),
+        "original_dtype": metadata[f"{prefix}.{which}.original_dtype"],
+    }
+
+
+def _read_prod_qt(f, metadata, prefix, which):
+    if metadata.get(f"{prefix}.{which}.present", "0") != "1":
+        return None
+    return {
+        "mse_indices": f.get_tensor(f"{prefix}.{which}.mse_indices"),
+        "qjl_signs": f.get_tensor(f"{prefix}.{which}.qjl_signs"),
+        "norms": f.get_tensor(f"{prefix}.{which}.norms"),
+        "residual_norms": f.get_tensor(f"{prefix}.{which}.residual_norms"),
+        "original_shape": json.loads(metadata[f"{prefix}.{which}.original_shape"]),
+        "original_dtype": metadata[f"{prefix}.{which}.original_dtype"],
+    }
+
+
+def _layer_kind(layer) -> str:
+    if isinstance(layer, TurboQuantProdLayer):
+        return "turboquant_prod"
+    if isinstance(layer, TurboQuantLayer):
+        return "turboquant_mse"
+    return "dynamic"
+
+
 def _serialize_layer(layer):
     keys = layer.keys.detach().cpu() if getattr(layer, "is_initialized", False) and layer.keys is not None else None
     values = layer.values.detach().cpu() if getattr(layer, "is_initialized", False) and layer.values is not None else None
@@ -497,6 +694,15 @@ def _deserialize_prod_quant(d, device):
 
 
 def _restore_layer(layer, state, device: torch.device):
+    expected_kind = _layer_kind(layer)
+    saved_kind = state["kind"]
+    if saved_kind != expected_kind:
+        raise ValueError(
+            f"Layer kind mismatch on restore: saved={saved_kind!r} but the "
+            f"reconstructed cache has a {expected_kind!r} layer. The cache "
+            f"config in the file does not match the rebuild parameters."
+        )
+
     keys = state.get("keys")
     values = state.get("values")
 
